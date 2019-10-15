@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# vim: filetype=sh
+# Debug, full trace
+set -x
+# Exit script if commands fail
+set -e
+
+trap 'trap - INT; kill -s HUP -- -$$' INT
+
+# Options
+CLEAR=5 # Clear password after N seconds (0 to disable, 
+        # password will be asked each run) 
+SHOW_PASSWORD=no # Show password in preview window
+AUTO_LOCK=900 # 15 minutes, default for bitwarden apps
+
+# Holds the available items in memory
+ITEMS=
+
+# To cut a long story short, the way systemd
+# interacts with the kernel key retention 
+# service means I can add a key but not 
+# read it. This is a workaround for that
+# bug.
+# 
+# This bug was introduced in systemd version
+# 233, and has been confirmed by me to be there
+# in version 239, version 240 is unconfirmed by
+# me and version 241 isn't affected by it
+
+SYSTEMD_VERSION=$(systemd --version | head -n1 | awk '{print $2}') 
+
+function ask_password() {
+    local password=
+    read -rs -p "Password: " password
+    echo "$password" | bw unlock 2>/dev/null | grep 'export' | sed -E 's/.*export BW_SESSION="(.*==)"$/\1/' || echo "Could not unlock vault"
+}
+
+function keyctl_timeout() {
+    if [[ $SYSTEMD_VERSION -ge 233 ]] && [[ $SYSTEMD_VERSION -le 240 ]]; then
+        keyctl link @us @s
+    fi
+
+    keyctl timeout "$key_id" $AUTO_LOCK
+    
+    if [[ $SYSTEMD_VERSION -ge 233 ]] && [[ $SYSTEMD_VERSION -le 240 ]]; then
+        keyctl unlink @us @s
+    fi
+}
+
+function keyctl_purge() {
+    if [[ $SYSTEMD_VERSION -ge 233 ]] && [[ $SYSTEMD_VERSION -le 240 ]]; then
+        keyctl link @us @s
+    fi
+    
+    keyctl purge user bw_session &>/dev/null
+    BW_HASH=$(ask_password) 
+    
+    if [[ $SYSTEMD_VERSION -ge 233 ]] && [[ $SYSTEMD_VERSION -le 240 ]]; then
+        keyctl unlink @us @s
+    fi
+}
+
+function keyctl_print_key() {
+    if [[ $SYSTEMD_VERSION -ge 233 ]] && [[ $SYSTEMD_VERSION -le 240 ]]; then
+        keyctl link @us @s
+    fi 
+    BW_HASH=$(keyctl pipe "$key_id")
+    if [[ $SYSTEMD_VERSION -ge 233 ]] && [[ $SYSTEMD_VERSION -le 240 ]]; then
+        keyctl unlink @us @s
+    fi
+}
+
+function get_session_key() {
+    if [ $AUTO_LOCK -eq 0 ]; then
+       keyctl_purge 
+    else
+      if ! key_id=$(keyctl request user bw_session 2>/dev/null); then
+          session=$(ask_password)
+          [[ -z "$session" ]] && exit_error 1 "Could not unlock vault"
+          key_id=$(echo -n "$session" | keyctl padd user bw_session @u)
+      fi
+      if [ $AUTO_LOCK -gt 0 ]; then
+          keyctl_timeout
+      fi
+      keyctl_print_key "$key_id"
+    fi
+}
+
+#source the hash file to gain access to the BitWarden CLI
+# Prefetch all the items
+function load_items() {
+    echo "$BW_HASH"
+    if ! ITEMS=$(bw list items --session "$BW_HASH" 2>/dev/null); then
+        echo "Could not load items"
+    fi
+}
+
+function bw_list () {
+    echo -n "$ITEMS" | jq -r '.[].name' | fzf --cycle --inline-info --ansi --layout=reverse --prompt="➜  " --preview="bw list items --session "$BW_HASH" --search {} | jq -C"
+}
+
+function main () {
+    if ! command -v bw > /dev/null; then
+        echo "Bitwarden commandline is missing. Exiting"
+        exit 1
+    fi
+
+    if ! command -v keyctl > /dev/null; then
+        echo "Keyctl is missing. Exiting"
+        exit 1
+    fi
+
+    get_session_key
+    load_items
+    bw_list
+}
+
+main
